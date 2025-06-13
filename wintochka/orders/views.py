@@ -21,20 +21,24 @@ def match_order(new_order):
     ticker = new_order.ticker
     is_buy = direction == "BUY"
 
-    counter_orders = LimitOrder.objects.filter(
+    counter_orders_queryset = LimitOrder.objects.filter(
         ticker=ticker,
         direction="SELL" if is_buy else "BUY",
         status="NEW"
     ).exclude(user=new_order.user)
 
-    counter_orders = sorted(
-        counter_orders,
-        key=lambda o: (o.price, o.timestamp) if is_buy else (-o.price, o.timestamp)
-    )
+    if is_buy:
+        counter_orders = list(counter_orders_queryset.order_by('price', 'timestamp'))
+    else:
+        counter_orders = list(counter_orders_queryset.order_by('-price', 'timestamp'))
+
     logger.debug(f"[match_order] Found {len(counter_orders)} counter orders")
 
     qty_remaining = new_order.original_qty - new_order.filled
     total_filled = 0
+
+    logged_insufficient_users = set()
+
 
     for order in counter_orders:
         counter_remaining = order.original_qty - order.filled
@@ -49,11 +53,15 @@ def match_order(new_order):
         seller_asset = Balance.objects.select_for_update().get_or_create(user=seller, ticker=ticker)[0]
 
         if buyer_rub.blocked < trade_cost:
-            logger.warning(f"[match_order] Buyer {buyer.id} has insufficient blocked RUB: {buyer_rub.blocked} < {trade_cost}")
+            if buyer.id not in logged_insufficient_users:
+                logger.warning(f"[match_order] Buyer {buyer.id} has insufficient blocked RUB: {buyer_rub.blocked} < {trade_cost}")
+                logged_insufficient_users.add(buyer.id)
             continue
 
         if seller_asset.blocked < trade_qty:
-            logger.warning(f"[match_order] Seller {seller.id} has insufficient blocked asset: {seller_asset.blocked} < {trade_qty}")
+            if seller.id not in logged_insufficient_users:
+                logger.warning(f"[match_order] Seller {seller.id} has insufficient blocked {ticker}: {seller_asset.blocked} < {trade_qty}")
+                logged_insufficient_users.add(seller.id)
             continue
 
         logger.info(f"[match_order] Executing trade: buyer={buyer.id}, seller={seller.id}, qty={trade_qty}, price={trade_price}")
@@ -247,6 +255,46 @@ class OrderListView(APIView):
 class OrderDetailCancelView(APIView):
     permission_classes = [HasAPIKey]
 
+    def get(self, request, order_id):
+        user = get_user_from_token(request)
+        logger.info(f"[OrderDetailView] User {user.id} requested details for order {order_id}")
+
+        try:
+            UUID(str(order_id))
+        except ValueError:
+            logger.warning("[OrderDetailView] Invalid UUID")
+            return Response({"error": "Invalid UUID"}, status=status.HTTP_400_BAD_REQUEST)
+
+        order = LimitOrder.objects.filter(id=order_id, user=user).first()
+        if not order:
+            order = MarketOrder.objects.filter(id=order_id, user=user).first()
+
+        if not order:
+            logger.warning(f"[OrderDetailView] Order {order_id} not found for user {user.id}")
+            return Response({"error": "Order not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        def serialize_order_detail(order):
+            data = {
+                "id": str(order.id),
+                "status": order.status,
+                "user_id": str(order.user.id),
+                "timestamp": order.timestamp.isoformat(),
+                "body": {
+                    "direction": order.direction,
+                    "ticker": order.ticker,
+                    "qty": order.qty if isinstance(order, MarketOrder) else order.original_qty
+                }
+            }
+            if isinstance(order, LimitOrder):
+                data["body"]["price"] = order.price
+                data["filled"] = order.filled
+                data["remaining"] = order.original_qty - order.filled
+            return data
+
+        serialized_data = serialize_order_detail(order)
+        logger.info(f"[OrderDetailView] Returned details for order {order_id}")
+        return Response(serialized_data, status=status.HTTP_200_OK)
+
     def delete(self, request, order_id):
         user = get_user_from_token(request)
         logger.info(f"[OrderDetailCancelView] User {user.id} requests cancel for {order_id}")
@@ -291,9 +339,11 @@ class OrderBookView(APIView):
         limit = min(int(request.query_params.get("limit", 10)), 25)
         logger.info(f"[OrderBookView] Getting orderbook for {ticker} with limit {limit}")
 
-        orders = LimitOrder.objects.filter(ticker=ticker, status="NEW", qty__gt=0)
-        bids = orders.filter(direction="BUY").values("price").annotate(qty=Sum("qty")).order_by("-price")[:limit]
-        asks = orders.filter(direction="SELL").values("price").annotate(qty=Sum("qty")).order_by("price")[:limit]
+        orders = LimitOrder.objects.filter(ticker=ticker, status="NEW", original_qty__gt=0)
+
+        bids = orders.filter(direction="BUY").values("price").annotate(qty=Sum("original_qty")).order_by("-price")[:limit]
+
+        asks = orders.filter(direction="SELL").values("price").annotate(qty=Sum("original_qty")).order_by("price")[:limit]
 
         logger.info("[OrderBookView] Orderbook fetched")
         return Response({"bid_levels": list(bids), "ask_levels": list(asks)})

@@ -6,8 +6,8 @@ from .models import Balance
 
 class BalanceView(APIView):
     permission_classes = [HasAPIKey]
-
     def get(self, request):
         user = get_user_from_token(request)
         balances = Balance.objects.filter(user=user)
-        return Response({b.ticker: b.amount for b in balances})
+        data = [{"ticker": b.ticker, "amount": b.amount, "blocked": b.blocked} for b in balances]
+        return Response(data)
