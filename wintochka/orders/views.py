@@ -37,15 +37,10 @@ def match_order(new_order):
     total_filled = 0
 
     for order in counter_orders:
-        logger.debug(f"[match_order] Trying match with {order.id}, price={order.price}, remaining={order.original_qty - order.filled}")
-
-        if (is_buy and new_order.price < order.price) or (not is_buy and new_order.price > order.price):
-            logger.info(f"[match_order] Order {order.id} skipped due to price mismatch")
-            break
-
-        trade_qty = min(qty_remaining, order.original_qty - order.filled)
+        counter_remaining = order.original_qty - order.filled
+        trade_qty = min(qty_remaining, counter_remaining)
         trade_price = order.price
-        total_cost = trade_qty * trade_price
+        trade_cost = trade_qty * trade_price
 
         buyer = new_order.user if is_buy else order.user
         seller = order.user if is_buy else new_order.user
@@ -53,8 +48,8 @@ def match_order(new_order):
         buyer_rub = Balance.objects.select_for_update().get_or_create(user=buyer, ticker="RUB")[0]
         seller_asset = Balance.objects.select_for_update().get_or_create(user=seller, ticker=ticker)[0]
 
-        if buyer_rub.blocked < total_cost:
-            logger.warning(f"[match_order] Buyer {buyer.id} has insufficient blocked RUB: {buyer_rub.blocked} < {total_cost}")
+        if buyer_rub.blocked < trade_cost:
+            logger.warning(f"[match_order] Buyer {buyer.id} has insufficient blocked RUB: {buyer_rub.blocked} < {trade_cost}")
             continue
 
         if seller_asset.blocked < trade_qty:
@@ -63,12 +58,11 @@ def match_order(new_order):
 
         logger.info(f"[match_order] Executing trade: buyer={buyer.id}, seller={seller.id}, qty={trade_qty}, price={trade_price}")
 
-        buyer_rub.blocked -= total_cost
-        buyer_rub.amount -= total_cost
+        buyer_rub.blocked -= trade_cost
         buyer_rub.save()
 
         seller_rub = Balance.objects.get_or_create(user=seller, ticker="RUB")[0]
-        seller_rub.amount += total_cost
+        seller_rub.amount += trade_cost
         seller_rub.save()
 
         buyer_asset = Balance.objects.get_or_create(user=buyer, ticker=ticker)[0]
@@ -76,29 +70,34 @@ def match_order(new_order):
         buyer_asset.save()
 
         seller_asset.blocked -= trade_qty
-        seller_asset.amount -= trade_qty
         seller_asset.save()
 
         order.filled += trade_qty
-        order.status = "EXECUTED" if order.original_qty == order.filled else "PARTIALLY_EXECUTED"
+        order.status = (
+            "EXECUTED" if order.filled == order.original_qty
+            else "PARTIALLY_EXECUTED"
+        )
         order.save()
 
         Transaction.objects.create(ticker=ticker, amount=trade_qty, price=trade_price)
-        logger.info(f"[match_order] Trade recorded for order {order.id}, new status: {order.status}")
+
+        logger.info(f"[match_order] Trade complete: counter_order={order.id}, filled={order.filled}, status={order.status}")
 
         qty_remaining -= trade_qty
         total_filled += trade_qty
 
         if qty_remaining <= 0:
-            logger.info("[match_order] New order fully matched, breaking loop")
             break
 
     new_order.filled += total_filled
-    new_order.status = "EXECUTED" if qty_remaining == 0 else "PARTIALLY_EXECUTED" if total_filled > 0 else "NEW"
+    new_order.status = (
+        "EXECUTED" if new_order.filled == new_order.original_qty
+        else "PARTIALLY_EXECUTED" if total_filled > 0
+        else "NEW"
+    )
     new_order.save()
 
-    logger.info(f"[match_order] Matching finished for order {new_order.id}. Final status: {new_order.status}, filled: {new_order.filled}")
-
+    logger.info(f"[match_order] Finished matching order {new_order.id}: filled={new_order.filled}, status={new_order.status}")
 
 class OrderCreateView(APIView):
     permission_classes = [HasAPIKey]
@@ -141,14 +140,14 @@ class OrderCreateView(APIView):
                     logger.debug(f"[OrderCreateView] Best price: {best_price}, Cost: {cost}")
 
                     if direction == "BUY":
-                        rub = Balance.objects.get_or_create(user=user, ticker="RUB")[0]
+                        rub = Balance.objects.get_or_create(user=user, ticker="RUB", defaults={"amount": 0, "blocked": 0})[0]
                         if rub.amount < cost:
                             logger.warning("[OrderCreateView] Insufficient RUB for market BUY")
                             return Response({"error": "Недостаточно средств"}, status=400)
                         rub.amount -= cost
                         rub.save()
                     else:
-                        asset = Balance.objects.get_or_create(user=user, ticker=ticker)[0]
+                        asset = Balance.objects.get_or_create(user=user, ticker=ticker, defaults={"amount": 0, "blocked": 0})[0]
                         if asset.amount < qty:
                             logger.warning("[OrderCreateView] Insufficient asset for market SELL")
                             return Response({"error": "Недостаточно монет"}, status=400)
@@ -172,7 +171,7 @@ class OrderCreateView(APIView):
                     cost = price * qty
 
                     if direction == "BUY":
-                        rub = Balance.objects.get_or_create(user=user, ticker="RUB")[0]
+                        rub = Balance.objects.get_or_create(user=user, ticker="RUB", defaults={"amount": 0, "blocked": 0})[0]
                         if rub.amount < cost:
                             logger.warning("[OrderCreateView] Insufficient RUB for limit BUY")
                             return Response({"error": "Недостаточно средств"}, status=400)
@@ -180,7 +179,7 @@ class OrderCreateView(APIView):
                         rub.blocked += cost
                         rub.save()
                     else:
-                        asset = Balance.objects.get_or_create(user=user, ticker=ticker)[0]
+                        asset = Balance.objects.get_or_create(user=user, ticker=ticker, defaults={"amount": 0, "blocked": 0})[0]
                         if asset.amount < qty:
                             logger.warning("[OrderCreateView] Insufficient asset for limit SELL")
                             return Response({"error": "Недостаточно монет"}, status=400)
@@ -270,13 +269,13 @@ class OrderDetailCancelView(APIView):
         remaining = order.original_qty - order.filled
         if order.direction == "BUY":
             refund = order.price * remaining
-            rub = Balance.objects.get(user=user, ticker="RUB")
+            rub = Balance.objects.get(user=user, ticker="RUB", defaults={"amount": 0, "blocked": 0})
             rub.amount += refund
             rub.blocked -= refund
             rub.save()
             logger.info(f"[OrderDetailCancelView] Refunded RUB: {refund} to user {user.id}")
         else:
-            asset = Balance.objects.get(user=user, ticker=order.ticker)
+            asset = Balance.objects.get(user=user, ticker=order.ticker, defaults={"amount": 0, "blocked": 0})
             asset.amount += remaining
             asset.blocked -= remaining
             asset.save()
