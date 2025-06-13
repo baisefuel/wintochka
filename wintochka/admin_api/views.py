@@ -1,7 +1,7 @@
 from uuid import UUID
 from rest_framework.views import APIView
 from rest_framework.response import Response
-from rest_framework import status
+from rest_framework import status, serializers
 from users.models import User
 from users.permissions import IsAdminAPIKey
 from django.shortcuts import get_object_or_404
@@ -110,6 +110,10 @@ class AdminBalanceWithdrawView(APIView):
 
         return Response({"success": True})
 
+class InstrumentSerializer(serializers.Serializer):
+    name = serializers.CharField()
+    ticker = serializers.RegexField(regex=r'^[A-Z]{2,10}$')
+
 class AdminInstrumentView(APIView):
     permission_classes = [IsAdminAPIKey]
 
@@ -122,27 +126,24 @@ class AdminInstrumentView(APIView):
         ])
 
     def post(self, request):
-        data = request.data
-        logger.info(f"[AdminInstrumentView][POST] Incoming data: {data}")
+        logger.info(f"[AdminInstrumentView][POST] Incoming data: {request.data}")
 
-        name = data.get("name")
-        ticker = data.get("ticker")
+        serializer = InstrumentSerializer(data=request.data)
+        if not serializer.is_valid():
+            logger.warning(f"[AdminInstrumentView][POST] Validation error: {serializer.errors}")
+            return Response(serializer.errors, status=status.HTTP_422_UNPROCESSABLE_ENTITY)
 
-        if not name or not ticker:
-            logger.warning(f"[AdminInstrumentView][POST] Missing name or ticker in request: {data}")
-            return Response({"error": "Missing name or ticker"}, status=400)
-
-        if not isinstance(ticker, str) or not ticker.isupper() or not (2 <= len(ticker) <= 10):
-            logger.warning(f"[AdminInstrumentView][POST] Invalid ticker format: {ticker}")
-            return Response({"error": "Invalid ticker format"}, status=400)
+        data = serializer.validated_data
+        name = data["name"]
+        ticker = data["ticker"]
 
         if Instrument.objects.filter(ticker=ticker).exists():
             logger.warning(f"[AdminInstrumentView][POST] Instrument already exists: {ticker}")
-            return Response({"error": "Instrument already exists"}, status=400)
+            return Response({"error": "Instrument already exists"}, status=status.HTTP_400_BAD_REQUEST)
 
         Instrument.objects.create(name=name, ticker=ticker)
         logger.info(f"[AdminInstrumentView][POST] Instrument created: {ticker} - {name}")
-        return Response({"success": True})
+        return Response({"success": True}, status=status.HTTP_200_OK)
 
 class AdminDeleteInstrumentView(APIView):
     permission_classes = [IsAdminAPIKey]
