@@ -7,6 +7,8 @@ from users.permissions import IsAdminAPIKey
 from django.shortcuts import get_object_or_404
 from balances.models import Balance
 from instruments.models import Instrument
+from django.core.exceptions import ValidationError
+import re
 
 import logging
 
@@ -133,49 +135,110 @@ class AdminBalanceWithdrawView(APIView):
         return Response({"success": True})
 
 class InstrumentSerializer(serializers.Serializer):
-    name = serializers.CharField()
-    ticker = serializers.RegexField(regex=r'^[A-Z]{2,10}$')
+    name = serializers.CharField(max_length=100)
+    ticker = serializers.CharField(max_length=10)
+
+    def validate_ticker(self, value):
+        """Кастомная валидация ticker согласно OpenAPI спецификации"""
+        if not re.fullmatch(r'^[A-Z]{2,10}$', value):
+            raise serializers.ValidationError(
+                "Ticker must be 2-10 uppercase letters"
+            )
+        return value
 
 class AdminInstrumentView(APIView):
     permission_classes = [IsAdminAPIKey]
 
     def get(self, request):
-        instruments = Instrument.objects.all()
-        logger.info(f"[AdminInstrumentView][GET] Returned {len(instruments)} instruments")
-        return Response([
-            {"ticker": i.ticker, "name": i.name}
-            for i in instruments
-        ])
+        """Список всех инструментов"""
+        instruments = Instrument.objects.all().order_by('ticker')
+        data = [{"ticker": i.ticker, "name": i.name} for i in instruments]
+        logger.info(f"Returned {len(instruments)} instruments")
+        return Response({"instruments": data})
 
     def post(self, request):
-        logger.info(f"[AdminInstrumentView][POST] Incoming data: {request.data}")
-
+        """Создание нового инструмента"""
+        logger.info(f"Incoming data: {request.data}")
         serializer = InstrumentSerializer(data=request.data)
         if not serializer.is_valid():
-            logger.warning(f"[AdminInstrumentView][POST] Validation error: {serializer.errors}")
-            return Response(serializer.errors, status=status.HTTP_422_UNPROCESSABLE_ENTITY)
+            logger.warning(f"Validation errors: {serializer.errors}")
+            return Response(
+                {
+                    "detail": "Validation error",
+                    "errors": serializer.errors
+                },
+                status=status.HTTP_422_UNPROCESSABLE_ENTITY
+            )
 
-        data = serializer.validated_data
-        name = data["name"]
-        ticker = data["ticker"]
-
+        ticker = serializer.validated_data['ticker']
         if Instrument.objects.filter(ticker=ticker).exists():
-            logger.warning(f"[AdminInstrumentView][POST] Instrument already exists: {ticker}")
-            return Response({"error": "Instrument already exists"}, status=422)
+            logger.warning(f"Instrument already exists: {ticker}")
+            return Response(
+                {
+                    "detail": "Instrument already exists",
+                    "ticker": ticker
+                },
+                status=status.HTTP_409_CONFLICT
+            )
 
-        Instrument.objects.create(name=name, ticker=ticker)
-        logger.info(f"[AdminInstrumentView][POST] Instrument created: {ticker} - {name}")
-        return Response({"success": True}, status=status.HTTP_200_OK)
+        try:
+            instrument = Instrument.objects.create(
+                name=serializer.validated_data['name'],
+                ticker=ticker
+            )
+            logger.info(f"Created instrument: {ticker}")
+            return Response(
+                {
+                    "success": True,
+                    "instrument": {
+                        "name": instrument.name,
+                        "ticker": instrument.ticker
+                    }
+                },
+                status=status.HTTP_201_CREATED
+            )
+        except Exception as e:
+            logger.error(f"Creation error: {str(e)}")
+            return Response(
+                {"detail": "Internal server error"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
 class AdminDeleteInstrumentView(APIView):
     permission_classes = [IsAdminAPIKey]
 
     def delete(self, request, ticker):
+        """Удаление инструмента по ticker"""
+        logger.info(f"Attempt to delete instrument: {ticker}")
+        if not re.fullmatch(r'^[A-Z]{2,10}$', ticker):
+            return Response(
+                {
+                    "detail": "Invalid ticker format",
+                    "expected_format": "2-10 uppercase letters"
+                },
+                status=status.HTTP_422_UNPROCESSABLE_ENTITY
+            )
+
         try:
             instrument = Instrument.objects.get(ticker=ticker)
+            instrument.delete()
+            logger.info(f"Deleted instrument: {ticker}")
+            return Response(
+                {"success": True},
+                status=status.HTTP_200_OK
+            )
         except Instrument.DoesNotExist:
-            return Response({"error": "Instrument not found"}, status=422)
-
-        instrument.delete()
-        return Response({"success": True})
-
+            logger.warning(f"Instrument not found: {ticker}")
+            return Response(
+                {
+                    "detail": "Instrument not found",
+                    "ticker": ticker
+                },
+                status=status.HTTP_404_NOT_FOUND
+            )
+        except Exception as e:
+            logger.error(f"Deletion error: {str(e)}")
+            return Response(
+                {"detail": "Internal server error"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
