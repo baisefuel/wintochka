@@ -39,8 +39,11 @@ class AdminBalanceDepositView(APIView):
 
     def post(self, request):
         data = request.data
+        logger.info(f"Admin deposit request received. Data: {data}")
         required_fields = {"user_id", "ticker", "amount"}
+
         if not required_fields.issubset(data):
+            logger.error("Missing required fields in deposit request")
             return Response({"error": "Missing required fields"}, status=422)
 
         try:
@@ -54,17 +57,25 @@ class AdminBalanceDepositView(APIView):
             if amount <= 0:
                 raise ValueError()
             ticker = raw_ticker
-        except Exception:
+        except Exception as e:
+            logger.error(f"Invalid data in deposit request: {str(e)}")
             return Response({"error": "Invalid user_id, ticker, or amount"}, status=422)
 
         try:
             user = User.objects.get(id=data["user_id"])
+            logger.info(f"User found: {user.id}")
         except User.DoesNotExist:
+            logger.error(f"User not found: {data['user_id']}")
             return Response({"error": "User not found"}, status=422)
 
-        balance, _ = Balance.objects.get_or_create(user=user, ticker=ticker)
+        balance, created = Balance.objects.get_or_create(user=user, ticker=ticker)
+        if created:
+            logger.info(f"New balance created for user {user.id}, ticker {ticker}")
+
+        logger.info(f"Depositing {amount} {ticker} to user {user.id}. Previous balance: {balance.amount}")
         balance.amount += amount
         balance.save()
+        logger.info(f"New balance after deposit: {balance.amount}")
 
         return Response({"success": True})
 
@@ -74,8 +85,11 @@ class AdminBalanceWithdrawView(APIView):
 
     def post(self, request):
         data = request.data
+        logger.info(f"Admin withdrawal request received. Data: {data}")
         required_fields = {"user_id", "ticker", "amount"}
+
         if not required_fields.issubset(data):
+            logger.error("Missing required fields in withdrawal request")
             return Response({"error": "Missing required fields"}, status=422)
 
         try:
@@ -89,24 +103,32 @@ class AdminBalanceWithdrawView(APIView):
             if amount <= 0:
                 raise ValueError()
             ticker = raw_ticker
-        except Exception:
+        except Exception as e:
+            logger.error(f"Invalid data in withdrawal request: {str(e)}")
             return Response({"error": "Invalid user_id, ticker, or amount"}, status=422)
 
         try:
             user = User.objects.get(id=data["user_id"])
+            logger.info(f"User found: {user.id}")
         except User.DoesNotExist:
+            logger.error(f"User not found: {data['user_id']}")
             return Response({"error": "User not found"}, status=422)
 
         try:
             balance = Balance.objects.get(user=user, ticker=ticker)
+            logger.info(f"Balance found for user {user.id}, ticker {ticker}. Current amount: {balance.amount}")
         except Balance.DoesNotExist:
+            logger.error(f"Balance not found for user {user.id}, ticker {ticker}")
             return Response({"error": "Balance not found"}, status=422)
 
         if balance.amount < amount:
+            logger.error(f"Insufficient funds. Requested: {amount}, available: {balance.amount}")
             return Response({"error": "Insufficient funds"}, status=422)
 
+        logger.info(f"Withdrawing {amount} {ticker} from user {user.id}. Previous balance: {balance.amount}")
         balance.amount -= amount
         balance.save()
+        logger.info(f"New balance after withdrawal: {balance.amount}")
 
         return Response({"success": True})
 

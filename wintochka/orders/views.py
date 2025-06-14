@@ -1,6 +1,6 @@
 from uuid import UUID
 from django.db import transaction
-from django.db.models import Sum
+from django.db.models import Sum, F, ExpressionWrapper, IntegerField
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
@@ -41,6 +41,8 @@ def match_order(new_order):
     transactions_to_create = []
 
     for order in counter_orders:
+        logger.info(f"[match_order] Matching against order {order.id} price={order.price} user={order.user.id}")
+
         if qty_remaining <= 0:
             break
 
@@ -62,8 +64,8 @@ def match_order(new_order):
         buyer = new_order.user if is_buy else order.user
         seller = order.user if is_buy else new_order.user
 
-        buyer_rub = Balance.objects.select_for_update().get_or_create(user=buyer, ticker="RUB", defaults={"amount": 0, "blocked": 0})[0]
-        seller_asset = Balance.objects.select_for_update().get_or_create(user=seller, ticker=ticker, defaults={"amount": 0, "blocked": 0})[0]
+        buyer_rub = Balance.objects.select_for_update().get_or_create(user=buyer, ticker="RUB")[0]
+        seller_asset = Balance.objects.select_for_update().get_or_create(user=seller, ticker=ticker)[0]
 
         if buyer_rub.blocked < trade_cost:
             if buyer.id not in logged_insufficient_users:
@@ -79,8 +81,8 @@ def match_order(new_order):
 
         logger.info(f"[match_order] Executing trade: buyer={buyer.id}, seller={seller.id}, qty={trade_qty}, price={trade_price}")
 
-        seller_rub = Balance.objects.get_or_create(user=seller, ticker="RUB", defaults={"amount": 0, "blocked": 0})[0]
-        buyer_asset = Balance.objects.get_or_create(user=buyer, ticker=ticker, defaults={"amount": 0, "blocked": 0})[0]
+        seller_rub = Balance.objects.get_or_create(user=seller, ticker="RUB")[0]
+        buyer_asset = Balance.objects.get_or_create(user=buyer, ticker=ticker)[0]
 
         buyer_rub.blocked -= trade_cost
         buyer_rub.save()
@@ -134,6 +136,41 @@ def match_order(new_order):
 class OrderCreateView(APIView):
     permission_classes = [HasAPIKey]
 
+    def get(self, request):
+        user = get_user_from_token(request)
+        logger.info(f"[OrderListView] User {user.id} requested order list")
+
+        market_orders = MarketOrder.objects.filter(user=user)
+        limit_orders = LimitOrder.objects.filter(user=user)
+
+        def serialize(order):
+            data = {
+                "id": str(order.id),
+                "status": order.status,
+                "user_id": str(order.user.id),
+                "timestamp": order.timestamp.isoformat(),
+            }
+            if isinstance(order, MarketOrder):
+                data["body"] = {
+                    "direction": order.direction,
+                    "ticker": order.ticker,
+                    "qty": order.qty
+                }
+            else:
+                data["body"] = {
+                    "direction": order.direction,
+                    "ticker": order.ticker,
+                    "qty": order.original_qty,
+                    "price": order.price
+                }
+                data["filled"] = order.filled
+                data["remaining"] = order.original_qty - order.filled
+            return data
+
+        result = list(map(serialize, market_orders)) + list(map(serialize, limit_orders))
+        logger.info(f"[OrderListView] Returned {len(result)} orders")
+        return Response(result)
+
     def post(self, request):
         user = get_user_from_token(request)
         data = request.data
@@ -172,14 +209,14 @@ class OrderCreateView(APIView):
                     logger.debug(f"[OrderCreateView] Best price: {best_price}, Cost: {cost}")
 
                     if direction == "BUY":
-                        rub = Balance.objects.get_or_create(user=user, ticker="RUB", defaults={"amount": 0, "blocked": 0})[0]
+                        rub = Balance.objects.get_or_create(user=user, ticker="RUB")[0]
                         if rub.amount < cost:
                             logger.warning("[OrderCreateView] Insufficient RUB for market BUY")
                             return Response({"error": "Недостаточно средств"}, status=400)
                         rub.amount -= cost
                         rub.save()
                     else:
-                        asset = Balance.objects.get_or_create(user=user, ticker=ticker, defaults={"amount": 0, "blocked": 0})[0]
+                        asset = Balance.objects.get_or_create(user=user, ticker=ticker)[0]
                         if asset.amount < qty:
                             logger.warning("[OrderCreateView] Insufficient asset for market SELL")
                             return Response({"error": "Недостаточно монет"}, status=400)
@@ -203,7 +240,7 @@ class OrderCreateView(APIView):
                     cost = price * qty
 
                     if direction == "BUY":
-                        rub = Balance.objects.get_or_create(user=user, ticker="RUB", defaults={"amount": 0, "blocked": 0})[0]
+                        rub = Balance.objects.get_or_create(user=user, ticker="RUB")[0]
                         if rub.amount < cost:
                             logger.warning("[OrderCreateView] Insufficient RUB for limit BUY")
                             return Response({"error": "Недостаточно средств"}, status=400)
@@ -211,7 +248,7 @@ class OrderCreateView(APIView):
                         rub.blocked += cost
                         rub.save()
                     else:
-                        asset = Balance.objects.get_or_create(user=user, ticker=ticker, defaults={"amount": 0, "blocked": 0})[0]
+                        asset = Balance.objects.get_or_create(user=user, ticker=ticker)[0]
                         if asset.amount < qty:
                             logger.warning("[OrderCreateView] Insufficient asset for limit SELL")
                             return Response({"error": "Недостаточно монет"}, status=400)
@@ -236,46 +273,6 @@ class OrderCreateView(APIView):
             logger.exception(f"[OrderCreateView] Internal error: {e}")
             return Response({"error": "Internal server error"}, status=500)
 
-
-class OrderListView(APIView):
-    permission_classes = [HasAPIKey]
-
-    def get(self, request):
-        user = get_user_from_token(request)
-        logger.info(f"[OrderListView] User {user.id} requested order list")
-
-        market_orders = MarketOrder.objects.filter(user=user)
-        limit_orders = LimitOrder.objects.filter(user=user)
-
-        def serialize(order):
-            data = {
-                "id": str(order.id),
-                "status": order.status,
-                "user_id": str(order.user.id),
-                "timestamp": order.timestamp.isoformat(),
-            }
-            if isinstance(order, MarketOrder):
-                data["body"] = {
-                    "direction": order.direction,
-                    "ticker": order.ticker,
-                    "qty": order.qty
-                }
-            else:
-                data["body"] = {
-                    "direction": order.direction,
-                    "ticker": order.ticker,
-                    "qty": order.original_qty,
-                    "price": order.price
-                }
-                data["filled"] = order.filled
-                data["remaining"] = order.original_qty - order.filled
-            return data
-
-        result = list(map(serialize, market_orders)) + list(map(serialize, limit_orders))
-        logger.info(f"[OrderListView] Returned {len(result)} orders")
-        return Response(result)
-
-
 class OrderDetailCancelView(APIView):
     permission_classes = [HasAPIKey]
 
@@ -293,9 +290,8 @@ class OrderDetailCancelView(APIView):
         if not order:
             order = MarketOrder.objects.filter(id=order_id, user=user).first()
 
-        if not order:
-            logger.warning(f"[OrderDetailView] Order {order_id} not found for user {user.id}")
-            return Response({"error": "Order not found"}, status=status.HTTP_404_NOT_FOUND)
+        if not order or order.status != OrderStatus.NEW:
+            return Response({"error": "Only NEW limit orders can be cancelled"}, status=400)
 
         def serialize_order_detail(order):
             data = {
@@ -341,13 +337,13 @@ class OrderDetailCancelView(APIView):
         remaining = order.original_qty - order.filled
         if order.direction == "BUY":
             refund = order.price * remaining
-            rub = Balance.objects.get(user=user, ticker="RUB", defaults={"amount": 0, "blocked": 0})
+            rub = Balance.objects.get(user=user, ticker="RUB")
             rub.amount += refund
             rub.blocked -= refund
             rub.save()
             logger.info(f"[OrderDetailCancelView] Refunded RUB: {refund} to user {user.id}")
         else:
-            asset = Balance.objects.get(user=user, ticker=order.ticker, defaults={"amount": 0, "blocked": 0})
+            asset = Balance.objects.get(user=user, ticker=order.ticker)
             asset.amount += remaining
             asset.blocked -= remaining
             asset.save()
@@ -364,12 +360,14 @@ class OrderBookView(APIView):
         logger.info(f"[OrderBookView] Getting orderbook for {ticker} with limit {limit}")
 
         try:
-            orders = LimitOrder.objects.filter(ticker=ticker, status="NEW", original_qty__gt=0)
+            orders = LimitOrder.objects.filter(
+                ticker=ticker, status="NEW"
+            ).annotate(
+                remaining_qty=ExpressionWrapper(F("original_qty") - F("filled"), output_field=IntegerField())
+            ).filter(remaining_qty__gt=0)
 
-            bids = orders.filter(direction="BUY").values("price").annotate(qty=Sum("original_qty")).order_by("-price")[:limit]
-
-            asks = orders.filter(direction="SELL").values("price").annotate(qty=Sum("original_qty")).order_by("price")[:limit]
-
+            bids = orders.filter(direction="BUY").values("price").annotate(qty=Sum("remaining_qty")).order_by("-price")[:limit]
+            asks = orders.filter(direction="SELL").values("price").annotate(qty=Sum("remaining_qty")).order_by("price")[:limit]
             logger.info("[OrderBookView] Orderbook fetched")
             return Response({"bid_levels": list(bids), "ask_levels": list(asks)})
         except Exception as e:
