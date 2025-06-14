@@ -25,7 +25,7 @@ def match_order(new_order):
         ticker=ticker,
         direction="SELL" if is_buy else "BUY",
         status="NEW"
-    ).exclude(user=new_order.user)
+    )
 
     if is_buy:
         counter_orders = list(counter_orders_queryset.order_by('price', 'timestamp'))
@@ -51,6 +51,12 @@ def match_order(new_order):
             continue
 
         trade_price = order.price
+
+        if isinstance(new_order, LimitOrder):
+            if (is_buy and new_order.price < order.price) or (not is_buy and new_order.price > order.price):
+                logger.info(f"[match_order] Skipping order {order.id} due to price mismatch: new_order.price={new_order.price}, order.price={order.price}")
+                break
+
         trade_cost = trade_qty * trade_price
 
         buyer = new_order.user if is_buy else order.user
@@ -63,13 +69,13 @@ def match_order(new_order):
             if buyer.id not in logged_insufficient_users:
                 logger.warning(f"[match_order] Buyer {buyer.id} has insufficient blocked RUB: {buyer_rub.blocked} < {trade_cost}")
                 logged_insufficient_users.add(buyer.id)
-            continue
+            break
 
         if seller_asset.blocked < trade_qty:
             if seller.id not in logged_insufficient_users:
                 logger.warning(f"[match_order] Seller {seller.id} has insufficient blocked {ticker}: {seller_asset.blocked} < {trade_qty}")
                 logged_insufficient_users.add(seller.id)
-            continue
+            break
 
         logger.info(f"[match_order] Executing trade: buyer={buyer.id}, seller={seller.id}, qty={trade_qty}, price={trade_price}")
 
@@ -117,7 +123,13 @@ def match_order(new_order):
     )
     new_order.save()
 
-    logger.info(f"[match_order] Finished matching order {new_order.id}: filled={new_order.filled}, status={new_order.status}")
+    logger.info(
+        f"[match_order] Finished matching order {new_order.id}: "
+        f"user={new_order.user.id}, direction={new_order.direction}, ticker={new_order.ticker}, "
+        f"price={getattr(new_order, 'price', 'MARKET')}, "
+        f"filled={new_order.filled}, remaining={new_order.original_qty - new_order.filled}, "
+        f"status={new_order.status}, type={'LimitOrder' if hasattr(new_order, 'price') else 'MarketOrder'}"
+    )
 
 class OrderCreateView(APIView):
     permission_classes = [HasAPIKey]
