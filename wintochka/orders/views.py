@@ -24,8 +24,8 @@ def match_order(new_order):
     counter_orders_queryset = LimitOrder.objects.filter(
         ticker=ticker,
         direction="SELL" if is_buy else "BUY",
-        status="NEW"
-    )
+        status=OrderStatus.NEW
+    ).select_related('user')
 
     if is_buy:
         counter_orders = list(counter_orders_queryset.order_by('price', 'timestamp'))
@@ -36,102 +36,105 @@ def match_order(new_order):
 
     qty_remaining = new_order.original_qty - new_order.filled
     total_filled = 0
-
     logged_insufficient_users = set()
     transactions_to_create = []
 
-    for order in counter_orders:
-        logger.info(f"[match_order] Matching against order {order.id} price={order.price} user={order.user.id}")
-
-        if qty_remaining <= 0:
-            break
-
-        counter_remaining = order.original_qty - order.filled
-        trade_qty = min(qty_remaining, counter_remaining)
-
-        if trade_qty <= 0:
-            continue
-
-        trade_price = order.price
-
-        if isinstance(new_order, LimitOrder):
-            if (is_buy and new_order.price < order.price) or (not is_buy and new_order.price > order.price):
-                logger.info(f"[match_order] Skipping order {order.id} due to price mismatch: new_order.price={new_order.price}, order.price={order.price}")
+    with transaction.atomic():
+        for order in counter_orders:
+            if qty_remaining <= 0:
                 break
 
-        trade_cost = trade_qty * trade_price
+            counter_remaining = order.original_qty - order.filled
+            trade_qty = min(qty_remaining, counter_remaining)
 
-        buyer = new_order.user if is_buy else order.user
-        seller = order.user if is_buy else new_order.user
+            if trade_qty <= 0:
+                continue
 
-        buyer_rub = Balance.objects.select_for_update().get_or_create(user=buyer, ticker="RUB")[0]
-        seller_asset = Balance.objects.select_for_update().get_or_create(user=seller, ticker=ticker)[0]
+            if isinstance(new_order, LimitOrder):
+                if (is_buy and new_order.price < order.price) or (not is_buy and new_order.price > order.price):
+                    logger.info(f"[match_order] Price mismatch: new_order={new_order.price}, counter={order.price}")
+                    break
 
-        if buyer_rub.blocked < trade_cost:
-            if buyer.id not in logged_insufficient_users:
-                logger.warning(f"[match_order] Buyer {buyer.id} has insufficient blocked RUB: {buyer_rub.blocked} < {trade_cost}")
-                logged_insufficient_users.add(buyer.id)
-            break
+            trade_price = order.price
+            trade_cost = trade_qty * trade_price
 
-        if seller_asset.blocked < trade_qty:
-            if seller.id not in logged_insufficient_users:
-                logger.warning(f"[match_order] Seller {seller.id} has insufficient blocked {ticker}: {seller_asset.blocked} < {trade_qty}")
-                logged_insufficient_users.add(seller.id)
-            break
+            buyer = new_order.user if is_buy else order.user
+            seller = order.user if is_buy else new_order.user
 
-        logger.info(f"[match_order] Executing trade: buyer={buyer.id}, seller={seller.id}, qty={trade_qty}, price={trade_price}")
+            buyer_rub = Balance.objects.select_for_update().get_or_create(user=buyer, ticker="RUB")[0]
+            seller_asset = Balance.objects.select_for_update().get_or_create(user=seller, ticker=ticker)[0]
 
-        seller_rub = Balance.objects.get_or_create(user=seller, ticker="RUB")[0]
-        buyer_asset = Balance.objects.get_or_create(user=buyer, ticker=ticker)[0]
+            if buyer_rub.blocked < trade_cost:
+                if buyer.id not in logged_insufficient_users:
+                    logger.warning(f"[match_order] Buyer {buyer.id} has insufficient RUB: {buyer_rub.blocked} < {trade_cost}")
+                    logged_insufficient_users.add(buyer.id)
+                continue
 
-        buyer_rub.blocked -= trade_cost
-        buyer_rub.save()
-        logger.info(f"[match_order][BALANCE_CHANGE] User {buyer_rub.user.id}: {buyer_rub.ticker} blocked changed by -{trade_cost}. New blocked: {buyer_rub.blocked}, New amount: {buyer_rub.amount}")
+            if seller_asset.blocked < trade_qty:
+                if seller.id not in logged_insufficient_users:
+                    logger.warning(f"[match_order] Seller {seller.id} has insufficient {ticker}: {seller_asset.blocked} < {trade_qty}")
+                    logged_insufficient_users.add(seller.id)
+                continue
 
-        seller_rub.amount += trade_cost
-        seller_rub.save()
-        logger.info(f"[match_order][BALANCE_CHANGE] User {seller_rub.user.id}: {seller_rub.ticker} amount changed by +{trade_cost}. New amount: {seller_rub.amount}")
+            logger.info(f"[match_order] Executing trade: buyer={buyer.id}, seller={seller.id}, qty={trade_qty}, price={trade_price}")
 
-        buyer_asset.amount += trade_qty
-        buyer_asset.save()
-        logger.info(f"[match_order][BALANCE_CHANGE] User {buyer_asset.user.id}: {buyer_asset.ticker} amount changed by +{trade_qty}. New amount: {buyer_asset.amount}")
+            seller_rub = Balance.objects.get_or_create(user=seller, ticker="RUB")[0]
+            buyer_asset = Balance.objects.get_or_create(user=buyer, ticker=ticker)[0]
 
-        seller_asset.blocked -= trade_qty
-        seller_asset.save()
-        logger.info(f"[match_order][BALANCE_CHANGE] User {seller_asset.user.id}: {seller_asset.ticker} blocked changed by -{trade_qty}. New blocked: {seller_asset.blocked}, New amount: {seller_asset.amount}")
-        order.filled += trade_qty
-        order.status = (
-            "EXECUTED" if order.filled == order.original_qty
-            else "PARTIALLY_EXECUTED"
-        )
-        order.save()
+            buyer_rub.blocked -= trade_cost
+            buyer_rub.save()
+            logger.info(f"[BALANCE] Buyer {buyer.id} RUB blocked -{trade_cost}. New: {buyer_rub.blocked}")
 
-        transactions_to_create.append(Transaction(ticker=ticker, amount=trade_qty, price=trade_price))
+            seller_rub.amount += trade_cost
+            seller_rub.save()
+            logger.info(f"[BALANCE] Seller {seller.id} RUB amount +{trade_cost}. New: {seller_rub.amount}")
 
-        logger.info(f"[match_order] Trade complete: counter_order={order.id}, filled={order.filled}, status={order.status}")
+            buyer_asset.amount += trade_qty
+            buyer_asset.save()
+            logger.info(f"[BALANCE] Buyer {buyer.id} {ticker} amount +{trade_qty}. New: {buyer_asset.amount}")
 
-        qty_remaining -= trade_qty
-        total_filled += trade_qty
+            seller_asset.blocked -= trade_qty
+            seller_asset.save()
+            logger.info(f"[BALANCE] Seller {seller.id} {ticker} blocked -{trade_qty}. New: {seller_asset.blocked}")
 
-    if transactions_to_create:
-        Transaction.objects.bulk_create(transactions_to_create)
-        logger.info(f"[match_order] Created {len(transactions_to_create)} trade transactions.")
+            order.filled += trade_qty
+            if order.filled >= order.original_qty:
+                order.status = OrderStatus.EXECUTED
+            elif order.filled > 0:
+                order.status = OrderStatus.PARTIALLY_EXECUTED
+            order.save()
+            logger.info(f"[ORDER] Counter order {order.id} updated. Filled: {order.filled}, Status: {order.status}")
 
-    new_order.filled += total_filled
-    new_order.status = (
-        "EXECUTED" if new_order.filled == new_order.original_qty
-        else "PARTIALLY_EXECUTED" if total_filled > 0
-        else "NEW"
-    )
-    new_order.save()
+            transactions_to_create.append(Transaction(
+                ticker=ticker,
+                amount=trade_qty,
+                price=trade_price,
+                buyer=buyer,
+                seller=seller
+            ))
+
+            qty_remaining -= trade_qty
+            total_filled += trade_qty
+
+        if total_filled > 0:
+            new_order.filled += total_filled
+            if new_order.filled >= new_order.original_qty:
+                new_order.status = OrderStatus.EXECUTED
+            else:
+                new_order.status = OrderStatus.PARTIALLY_EXECUTED
+            new_order.save()
+            logger.info(f"[ORDER] New order {new_order.id} updated. Filled: {new_order.filled}, Status: {new_order.status}")
+
+        if transactions_to_create:
+            Transaction.objects.bulk_create(transactions_to_create)
+            logger.info(f"[match_order] Created {len(transactions_to_create)} transactions")
 
     logger.info(
-        f"[match_order] Finished matching order {new_order.id}: "
-        f"user={new_order.user.id}, direction={new_order.direction}, ticker={new_order.ticker}, "
-        f"price={getattr(new_order, 'price', 'MARKET')}, "
-        f"filled={new_order.filled}, remaining={new_order.original_qty - new_order.filled}, "
-        f"status={new_order.status}, type={'LimitOrder' if hasattr(new_order, 'price') else 'MarketOrder'}"
+        f"[match_order] Matching completed for order {new_order.id}. "
+        f"Final status: {new_order.status}, "
+        f"Filled: {new_order.filled}/{new_order.original_qty}"
     )
+    return total_filled
 
 class OrderCreateView(APIView):
     permission_classes = [HasAPIKey]

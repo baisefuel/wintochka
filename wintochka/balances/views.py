@@ -9,5 +9,5 @@ class BalanceView(APIView):
     def get(self, request):
         user = get_user_from_token(request)
         balances = Balance.objects.filter(user=user)
-        data = [{"ticker": b.ticker, "amount": b.amount} for b in balances]
+        data = {b.ticker: b.amount for b in balances}
         return Response(data)
