@@ -46,7 +46,7 @@ class LimitOrder(models.Model):
         ("EXECUTED", "EXECUTED"),
         ("PARTIALLY_EXECUTED", "PARTIALLY_EXECUTED"),
         ("CANCELLED", "CANCELLED")
-    ])
+    ], default=OrderStatus.NEW)
     timestamp = models.DateTimeField(auto_now_add=True)
 
     @property

@@ -38,19 +38,26 @@ def match_order(new_order):
     total_filled = 0
 
     logged_insufficient_users = set()
-
+    transactions_to_create = []
 
     for order in counter_orders:
+        if qty_remaining <= 0:
+            break
+
         counter_remaining = order.original_qty - order.filled
         trade_qty = min(qty_remaining, counter_remaining)
+
+        if trade_qty <= 0:
+            continue
+
         trade_price = order.price
         trade_cost = trade_qty * trade_price
 
         buyer = new_order.user if is_buy else order.user
         seller = order.user if is_buy else new_order.user
 
-        buyer_rub = Balance.objects.select_for_update().get_or_create(user=buyer, ticker="RUB")[0]
-        seller_asset = Balance.objects.select_for_update().get_or_create(user=seller, ticker=ticker)[0]
+        buyer_rub = Balance.objects.select_for_update().get_or_create(user=buyer, ticker="RUB", defaults={"amount": 0, "blocked": 0})[0]
+        seller_asset = Balance.objects.select_for_update().get_or_create(user=seller, ticker=ticker, defaults={"amount": 0, "blocked": 0})[0]
 
         if buyer_rub.blocked < trade_cost:
             if buyer.id not in logged_insufficient_users:
@@ -66,20 +73,24 @@ def match_order(new_order):
 
         logger.info(f"[match_order] Executing trade: buyer={buyer.id}, seller={seller.id}, qty={trade_qty}, price={trade_price}")
 
+        seller_rub = Balance.objects.get_or_create(user=seller, ticker="RUB", defaults={"amount": 0, "blocked": 0})[0]
+        buyer_asset = Balance.objects.get_or_create(user=buyer, ticker=ticker, defaults={"amount": 0, "blocked": 0})[0]
+
         buyer_rub.blocked -= trade_cost
         buyer_rub.save()
+        logger.info(f"[match_order][BALANCE_CHANGE] User {buyer_rub.user.id}: {buyer_rub.ticker} blocked changed by -{trade_cost}. New blocked: {buyer_rub.blocked}, New amount: {buyer_rub.amount}")
 
-        seller_rub = Balance.objects.get_or_create(user=seller, ticker="RUB")[0]
         seller_rub.amount += trade_cost
         seller_rub.save()
+        logger.info(f"[match_order][BALANCE_CHANGE] User {seller_rub.user.id}: {seller_rub.ticker} amount changed by +{trade_cost}. New amount: {seller_rub.amount}")
 
-        buyer_asset = Balance.objects.get_or_create(user=buyer, ticker=ticker)[0]
         buyer_asset.amount += trade_qty
         buyer_asset.save()
+        logger.info(f"[match_order][BALANCE_CHANGE] User {buyer_asset.user.id}: {buyer_asset.ticker} amount changed by +{trade_qty}. New amount: {buyer_asset.amount}")
 
         seller_asset.blocked -= trade_qty
         seller_asset.save()
-
+        logger.info(f"[match_order][BALANCE_CHANGE] User {seller_asset.user.id}: {seller_asset.ticker} blocked changed by -{trade_qty}. New blocked: {seller_asset.blocked}, New amount: {seller_asset.amount}")
         order.filled += trade_qty
         order.status = (
             "EXECUTED" if order.filled == order.original_qty
@@ -87,15 +98,16 @@ def match_order(new_order):
         )
         order.save()
 
-        Transaction.objects.create(ticker=ticker, amount=trade_qty, price=trade_price)
+        transactions_to_create.append(Transaction(ticker=ticker, amount=trade_qty, price=trade_price))
 
         logger.info(f"[match_order] Trade complete: counter_order={order.id}, filled={order.filled}, status={order.status}")
 
         qty_remaining -= trade_qty
         total_filled += trade_qty
 
-        if qty_remaining <= 0:
-            break
+    if transactions_to_create:
+        Transaction.objects.bulk_create(transactions_to_create)
+        logger.info(f"[match_order] Created {len(transactions_to_create)} trade transactions.")
 
     new_order.filled += total_filled
     new_order.status = (
@@ -339,14 +351,22 @@ class OrderBookView(APIView):
         limit = min(int(request.query_params.get("limit", 10)), 25)
         logger.info(f"[OrderBookView] Getting orderbook for {ticker} with limit {limit}")
 
-        orders = LimitOrder.objects.filter(ticker=ticker, status="NEW", original_qty__gt=0)
+        try:
+            orders = LimitOrder.objects.filter(ticker=ticker, status="NEW", original_qty__gt=0)
 
-        bids = orders.filter(direction="BUY").values("price").annotate(qty=Sum("original_qty")).order_by("-price")[:limit]
+            bids = orders.filter(direction="BUY").values("price").annotate(qty=Sum("original_qty")).order_by("-price")[:limit]
 
-        asks = orders.filter(direction="SELL").values("price").annotate(qty=Sum("original_qty")).order_by("price")[:limit]
+            asks = orders.filter(direction="SELL").values("price").annotate(qty=Sum("original_qty")).order_by("price")[:limit]
 
-        logger.info("[OrderBookView] Orderbook fetched")
-        return Response({"bid_levels": list(bids), "ask_levels": list(asks)})
+            logger.info("[OrderBookView] Orderbook fetched")
+            return Response({"bid_levels": list(bids), "ask_levels": list(asks)})
+        except Exception as e:
+            logger.exception(f"[OrderBookView] Internal server error for ticker {ticker}: {e}")
+            return Response(
+                {"error": "Internal server error. Please try again later."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
 
 class TransactionHistoryView(APIView):
     def get(self, request, ticker):

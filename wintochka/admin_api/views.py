@@ -18,9 +18,9 @@ class AdminDeleteUserView(APIView):
 
     def delete(self, request, user_id):
         try:
-            user_id = UUID(str(user_id)) 
+            user_id = UUID(str(user_id))
         except (ValueError, TypeError):
-            return Response({"error": "Invalid UUID"}, status=400)
+            return Response({"error": "Invalid UUID"}, status=422)
 
         user = get_object_or_404(User, id=user_id)
 
@@ -41,7 +41,7 @@ class AdminBalanceDepositView(APIView):
         data = request.data
         required_fields = {"user_id", "ticker", "amount"}
         if not required_fields.issubset(data):
-            return Response({"error": "Missing required fields"}, status=400)
+            return Response({"error": "Missing required fields"}, status=422)
 
         try:
             raw_user = data.get("user_id")
@@ -55,12 +55,12 @@ class AdminBalanceDepositView(APIView):
                 raise ValueError()
             ticker = raw_ticker
         except Exception:
-            return Response({"error": "Invalid user_id, ticker, or amount"}, status=400)
+            return Response({"error": "Invalid user_id, ticker, or amount"}, status=422)
 
         try:
             user = User.objects.get(id=data["user_id"])
         except User.DoesNotExist:
-            return Response({"error": "User not found"}, status=404)
+            return Response({"error": "User not found"}, status=422)
 
         balance, _ = Balance.objects.get_or_create(user=user, ticker=ticker)
         balance.amount += amount
@@ -76,7 +76,7 @@ class AdminBalanceWithdrawView(APIView):
         data = request.data
         required_fields = {"user_id", "ticker", "amount"}
         if not required_fields.issubset(data):
-            return Response({"error": "Missing required fields"}, status=400)
+            return Response({"error": "Missing required fields"}, status=422)
 
         try:
             raw_user = data.get("user_id")
@@ -90,20 +90,20 @@ class AdminBalanceWithdrawView(APIView):
                 raise ValueError()
             ticker = raw_ticker
         except Exception:
-            return Response({"error": "Invalid user_id, ticker, or amount"}, status=400)
+            return Response({"error": "Invalid user_id, ticker, or amount"}, status=422)
 
         try:
             user = User.objects.get(id=data["user_id"])
         except User.DoesNotExist:
-            return Response({"error": "User not found"}, status=404)
+            return Response({"error": "User not found"}, status=422)
 
         try:
             balance = Balance.objects.get(user=user, ticker=ticker)
         except Balance.DoesNotExist:
-            return Response({"error": "Balance not found"}, status=404)
+            return Response({"error": "Balance not found"}, status=422)
 
         if balance.amount < amount:
-            return Response({"error": "Insufficient funds"}, status=400)
+            return Response({"error": "Insufficient funds"}, status=422)
 
         balance.amount -= amount
         balance.save()
@@ -139,7 +139,7 @@ class AdminInstrumentView(APIView):
 
         if Instrument.objects.filter(ticker=ticker).exists():
             logger.warning(f"[AdminInstrumentView][POST] Instrument already exists: {ticker}")
-            return Response({"error": "Instrument already exists"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"error": "Instrument already exists"}, status=422)
 
         Instrument.objects.create(name=name, ticker=ticker)
         logger.info(f"[AdminInstrumentView][POST] Instrument created: {ticker} - {name}")
@@ -152,7 +152,7 @@ class AdminDeleteInstrumentView(APIView):
         try:
             instrument = Instrument.objects.get(ticker=ticker)
         except Instrument.DoesNotExist:
-            return Response({"error": "Instrument not found"}, status=404)
+            return Response({"error": "Instrument not found"}, status=422)
 
         instrument.delete()
         return Response({"success": True})
